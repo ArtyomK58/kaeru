@@ -191,36 +191,39 @@ fn terms(query: &str) -> Option<Vec<Term<'_>>> {
 ///
 /// A prefix word is separated from a bare word before it by `AND`, which is
 /// what the bare words mean already (a phrase group without `*` is tokenized
-/// into an AND of its words), and its stem is lowercased.
+/// into an AND of its words), and its stem is lowercased. Keep the split group
+/// parenthesised: Cozo gives OR higher precedence than AND, so an exposed AND
+/// would change which words a neighbouring OR applies to.
 fn split_prefix_terms(query: &str) -> Cow<'_, str> {
     let Some(terms) = terms(query) else {
         return Cow::Borrowed(query);
     };
     let mut out = Vec::with_capacity(terms.len());
     let mut changed = false;
-    let mut after_bare_word = false;
+    let mut bare_group_start = None;
     for term in &terms {
         match *term {
             Term::Word { stem, prefix: true } => {
-                if after_bare_word {
-                    out.push("AND".to_string());
-                    changed = true;
-                }
                 let lower = stem.to_lowercase();
+                if let Some(start) = bare_group_start.take() {
+                    let bare = out.split_off(start).join(" ");
+                    out.push(format!("({bare} AND {lower}*)"));
+                    changed = true;
+                } else {
+                    out.push(format!("{lower}*"));
+                }
                 changed |= lower != stem;
-                out.push(format!("{lower}*"));
-                after_bare_word = false;
             }
             Term::Word {
                 stem,
                 prefix: false,
             } => {
+                bare_group_start.get_or_insert(out.len());
                 out.push(stem.to_string());
-                after_bare_word = true;
             }
             Term::Operator(s) | Term::Phrase(s) => {
                 out.push(s.to_string());
-                after_bare_word = false;
+                bare_group_start = None;
             }
         }
     }
@@ -384,10 +387,52 @@ mod tests {
         assert_eq!(hits.len(), 2);
     }
 
+    /// Splitting a phrase group must not expose its AND to Cozo's OR
+    /// precedence: `alpha beta* OR gamma` includes gamma without alpha.
+    #[test]
+    fn splitting_a_prefix_preserves_boolean_operands() {
+        let store = Store::open_in_memory().expect("open");
+        store.use_initiative("t");
+        for (name, body) in [
+            ("case-one", "alpha beta"),
+            ("case-two", "gamma"),
+            ("case-three", "alpha gamma"),
+            ("case-four", "beta"),
+        ] {
+            write_episode(
+                &store,
+                EpisodeKind::Observation,
+                Significance::Low,
+                name,
+                body,
+            )
+            .expect("write");
+        }
+        for (query, grouped, count) in [
+            ("alpha beta* OR gamma", "(alpha AND beta*) OR gamma", 3),
+            ("gamma OR alpha beta*", "gamma OR (alpha AND beta*)", 3),
+            ("alpha beta* NOT gamma", "(alpha AND beta*) NOT gamma", 1),
+            ("gamma NOT alpha beta*", "gamma NOT (alpha AND beta*)", 2),
+        ] {
+            let names = |q| {
+                let mut names: Vec<_> = fuzzy_recall(&store, q, 10)
+                    .expect("parses")
+                    .into_iter()
+                    .map(|hit| hit.name)
+                    .collect();
+                names.sort();
+                names
+            };
+            let expected = names(grouped);
+            assert_eq!(expected.len(), count, "fixture for `{grouped}`");
+            assert_eq!(names(query), expected, "`{query}` preserves its operands");
+        }
+    }
+
     #[test]
     fn only_a_prefix_after_a_bare_word_is_split() {
-        assert_eq!(split_prefix_terms("a b*"), "a AND b*");
-        assert_eq!(split_prefix_terms("a b c*"), "a b AND c*");
+        assert_eq!(split_prefix_terms("a b*"), "(a AND b*)");
+        assert_eq!(split_prefix_terms("a b c*"), "(a b AND c*)");
         assert_eq!(split_prefix_terms("Ab*"), "ab*");
         for q in [
             "a b",
