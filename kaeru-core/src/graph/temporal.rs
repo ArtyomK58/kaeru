@@ -54,7 +54,7 @@ pub fn at(store: &Store, id: &NodeId, at_seconds: f64) -> Result<Option<NodeSnap
     let script = format!(
         r#"
         ?[type, tier, name, body, tags, layer, visibility, validity] :=
-            *node{{id, type, tier, name, body, tags, layer, visibility, validity @ {at_seconds}}}, id = $id
+            id = $id, *node{{id, type, tier, name, body, tags, layer, visibility, validity @ {at_seconds}}}
         "#
     );
     let rows = store
@@ -110,7 +110,7 @@ pub fn history(store: &Store, id: &NodeId) -> Result<Vec<Revision>> {
     // Without the `@` modifier, the read sees every bi-temporal row,
     // including retractions.
     let script = r#"
-        ?[validity, name, body] := *node{id, validity, name, body}, id = $id
+        ?[validity, name, body] := id = $id, *node{id, validity, name, body}
         :order validity
     "#;
     let rows = store
