@@ -104,6 +104,50 @@ impl CloudClient {
         self.get(&url).await
     }
 
+    /// Full read without import, restricted to the requested initiative.
+    /// Older cloud APIs expose GET by id globally. Confirm membership against
+    /// their paged initiative listing before releasing the body to a caller.
+    pub async fn get_node_in_initiative(
+        &self,
+        initiative: &str,
+        id: &str,
+    ) -> Result<(u16, String), String> {
+        let (code, body) = self.get_node(id).await?;
+        if !(200..300).contains(&code) {
+            return Ok((code, body));
+        }
+        let node: Value = serde_json::from_str(&body)
+            .map_err(|e| format!("cloud `{}` invalid node: {e}", self.name()))?;
+        let name = node
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "cloud node has no name".to_string())?;
+        let mut offset = 0;
+        loop {
+            let (status, page) = self
+                .list_initiative(initiative, 500, offset, Some(name))
+                .await?;
+            if !(200..300).contains(&status) {
+                return Err(format!(
+                    "cloud `{}` membership check failed ({status})",
+                    self.name()
+                ));
+            }
+            let nodes: Vec<Value> = serde_json::from_str(&page)
+                .map_err(|e| format!("cloud membership list invalid: {e}"))?;
+            if nodes
+                .iter()
+                .any(|n| n.get("id").and_then(Value::as_str) == Some(id))
+            {
+                return Ok((code, body));
+            }
+            if nodes.len() < 500 {
+                return Ok((404, "node is not in the requested initiative".into()));
+            }
+            offset += nodes.len();
+        }
+    }
+
     /// `POST /api/v1/edges` — push an edge between two shared nodes.
     pub async fn post_edge(&self, body: &Value) -> Result<(u16, String), String> {
         let url = format!("{}/api/v1/edges", self.base_url);

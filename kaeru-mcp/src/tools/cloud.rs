@@ -11,13 +11,17 @@
 //! pre-share secret guard. Both gates fail *safe* — a refusal returns an
 //! explanatory message, never a silent push.
 
-use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Arc;
 
-use kaeru_core::{EdgeType, Error, Layer, NodeType, SharePolicy, Store, Tier, Visibility};
+use kaeru_core::{
+    CloudEdge, EdgeImportResult, EdgeType, Error, Layer, NodeType, SharePolicy, Store, Tier,
+    Visibility, restore_cloud_edges_cancellable,
+};
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::cloud_client::{CloudClient, CloudRegistry};
 use crate::utils::{resolve_name_or_id, text, to_mcp, with_initiative};
@@ -483,10 +487,12 @@ pub async fn unshare(
 }
 
 /// Lists the shared nodes the cloud holds for an initiative — discovery
-/// before `pull`.
+/// before `pull`. If `id` is specified, returns the full shared node directly
+/// without materialising it into the local vault or modifying the graph.
 pub async fn cloud_recall(
     cloud: Option<&CloudClient>,
     initiative: &str,
+    id: Option<&str>,
     query: Option<&str>,
     limit: Option<usize>,
     offset: Option<usize>,
@@ -496,6 +502,52 @@ pub async fn cloud_recall(
     const DEFAULT_LIMIT: usize = 25;
 
     let cloud = cloud.ok_or_else(not_configured)?;
+
+    if let Some(node_id) = id {
+        let (code, resp) = cloud
+            .get_node_in_initiative(initiative, node_id)
+            .await
+            .map_err(|e| McpError::internal_error(format!("cloud GET failed: {e}"), None))?;
+        if code == 404 {
+            return Ok(text(&format!(
+                "cloud `{}`: has no node {node_id}",
+                cloud.name()
+            )));
+        }
+        if !(200..300).contains(&code) {
+            return Ok(text(&format!(
+                "cloud `{}`: GET failed ({code}): {resp}",
+                cloud.name()
+            )));
+        }
+        let v: Value = serde_json::from_str(&resp)
+            .map_err(|e| McpError::internal_error(format!("bad cloud response: {e}"), None))?;
+        let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
+        let nt = v.get("node_type").and_then(|x| x.as_str()).unwrap_or("");
+        let tier = v.get("tier").and_then(|x| x.as_str()).unwrap_or("");
+        let layer = v.get("layer").and_then(|x| x.as_str()).unwrap_or("");
+        let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
+        let tags: Vec<String> = v
+            .get("tags")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tag_line = if tags.is_empty() {
+            String::new()
+        } else {
+            format!("\ntags: {}", tags.join(", "))
+        };
+        return Ok(text(&format!(
+            "cloud `{}` · `{initiative}`: node {node_id} (read-only, not imported)\n\
+             name: {name}\ntype: {nt} · tier: {tier} · layer: {layer}{tag_line}\n\n{body}\n\n\
+             ⤷ `pull {node_id} {initiative}` materialises it locally with edges.",
+            cloud.name()
+        )));
+    }
     let limit = limit.unwrap_or(DEFAULT_LIMIT).max(1);
     let offset = offset.unwrap_or(0);
 
@@ -639,10 +691,11 @@ fn initiative_total(body: &str, initiative: &str) -> Option<usize> {
 /// recall mechanism. Materialises it under the same id, attached to the
 /// given initiative, so it joins the local working graph.
 pub async fn pull(
-    store: &Store,
+    store: Arc<Store>,
     cloud: Option<&CloudClient>,
     id: &str,
     initiative: &str,
+    cancel: CancellationToken,
 ) -> Result<CallToolResult, McpError> {
     let cloud = cloud.ok_or_else(not_configured)?;
 
@@ -689,27 +742,34 @@ pub async fn pull(
     // `upsert_node` to keep whatever is local rather than clear it. That
     // ordering matters: the destructive case was pulling a `cite` to refresh
     // it and losing the URL it was cited for (#85).
-    let properties = v.get("properties").filter(|p| !p.is_null());
-
-    kaeru_core::upsert_node(
-        store,
-        &id.to_string(),
-        node_type,
-        tier,
-        &name,
-        body.as_deref(),
-        &tags,
-        Some(initiative),
-        Visibility::Shared,
-        layer,
-        properties,
-    )
+    let properties = v.get("properties").filter(|p| !p.is_null()).cloned();
+    let write_store = store.clone();
+    let write_id = id.to_string();
+    let write_init = initiative.to_string();
+    let write_name = name.clone();
+    tokio::task::spawn_blocking(move || {
+        kaeru_core::upsert_node(
+            &write_store,
+            &write_id,
+            node_type,
+            tier,
+            &write_name,
+            body.as_deref(),
+            &tags,
+            Some(&write_init),
+            Visibility::Shared,
+            layer,
+            properties.as_ref(),
+        )
+    })
+    .await
+    .map_err(|e| McpError::internal_error(format!("node import task failed: {e}"), None))?
     .map_err(to_mcp)?;
 
     // Rebuild structure: recreate every cloud edge of this initiative whose
     // BOTH endpoints already exist locally. Pulling more nodes fills in more
     // edges over time; an edge to a not-yet-pulled node is simply skipped.
-    let rebuilt = recreate_local_edges(store, cloud, initiative).await?;
+    let rebuilt = recreate_local_edges(store, cloud, initiative, Some(id), cancel).await?;
     let mut edge_parts = vec![format!("+{} edge(s) linked", rebuilt.linked)];
     if rebuilt.kept > 0 {
         edge_parts.push(format!("{} already local, left as they are", rebuilt.kept));
@@ -721,83 +781,54 @@ pub async fn pull(
     )))
 }
 
-/// Fetches the initiative's edges from the cloud and `link`s locally every
-/// one whose both endpoints are already present in the local vault.
-/// Idempotent at NOW (re-linking an existing edge is harmless).
+/// Fetch the cloud graph once, then delegate bounded node-local work to core.
 async fn recreate_local_edges(
-    store: &Store,
+    store: Arc<Store>,
     cloud: &CloudClient,
     initiative: &str,
-) -> Result<EdgeRebuild, McpError> {
-    let (code, resp) = cloud
-        .list_edges(initiative)
-        .await
-        .map_err(|e| McpError::internal_error(format!("cloud list edges failed: {e}"), None))?;
+    target_node: Option<&str>,
+    cancel: CancellationToken,
+) -> Result<EdgeImportResult, McpError> {
+    let target =
+        target_node.ok_or_else(|| McpError::invalid_params("pull requires a target node", None))?;
+    let (code, resp) = cloud.list_edges(initiative).await.map_err(|e| {
+        McpError::internal_error(
+            format!("cloud `{}` list edges failed: {e}", cloud.name()),
+            None,
+        )
+    })?;
     if !(200..300).contains(&code) {
-        return Ok(EdgeRebuild { linked: 0, kept: 0 });
+        return Err(McpError::internal_error(
+            format!(
+                "node imported, but cloud `{}` edge restore failed ({code})",
+                cloud.name()
+            ),
+            None,
+        ));
     }
-    let items: Vec<Value> = serde_json::from_str::<Value>(&resp)
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-
-    // What the vault already holds, read once. A cloud edge that matches one
-    // of these is left exactly as it is: `recreate_local_edges` used to call
-    // `link_with_weight` unconditionally, which meant every pull reverted a
-    // local `reweight` (a reweight never reaches the cloud, so the cloud's
-    // value is by definition the stale one) and re-linked what `unlink` had
-    // just retracted (#85).
-    let local_edges: HashSet<(String, String, String)> =
-        kaeru_core::edges_in_initiative(store, initiative)
-            .map_err(to_mcp)?
-            .into_iter()
-            .map(|(src, dst, et, _)| (src, dst, et))
-            .collect();
-
-    let mut linked = 0;
-    let mut kept = 0;
-    for it in &items {
-        let src = it.get("src").and_then(|x| x.as_str()).unwrap_or("");
-        let dst = it.get("dst").and_then(|x| x.as_str()).unwrap_or("");
-        let et = it.get("edge_type").and_then(|x| x.as_str()).unwrap_or("");
-        if src.is_empty() || dst.is_empty() || et.is_empty() {
-            continue;
-        }
-        // Preserve the cloud edge's weight (default 1.0 for older payloads).
-        let weight = it.get("weight").and_then(|x| x.as_f64()).unwrap_or(1.0);
-        let both_local = kaeru_core::node_brief_by_id(store, &src.to_string())
-            .ok()
-            .flatten()
-            .is_some()
-            && kaeru_core::node_brief_by_id(store, &dst.to_string())
-                .ok()
-                .flatten()
-                .is_some();
-        if !both_local {
-            continue;
-        }
-        let Ok(edge) = et.parse::<EdgeType>() else {
-            continue;
-        };
-        if local_edges.contains(&(src.to_string(), dst.to_string(), et.to_string())) {
-            kept += 1;
-            continue;
-        }
-        with_initiative(store, Some(initiative), || {
-            kaeru_core::link_with_weight(store, &src.to_string(), &dst.to_string(), edge, weight)
-                .map_err(to_mcp)
-        })?;
-        linked += 1;
-    }
-    Ok(EdgeRebuild { linked, kept })
-}
-
-/// What one pull's edge rebuild did.
-struct EdgeRebuild {
-    /// Edges the cloud held that the vault did not, now created locally.
-    linked: usize,
-    /// Edges already present locally, left untouched — weight and all.
-    kept: usize,
+    let items: Vec<Value> = serde_json::from_str(&resp)
+        .map_err(|e| McpError::internal_error(format!("invalid cloud edge list: {e}"), None))?;
+    let edges: Vec<CloudEdge> = items
+        .iter()
+        .filter_map(|v| {
+            Some((
+                v.get("src")?.as_str()?.into(),
+                v.get("dst")?.as_str()?.into(),
+                v.get("edge_type")?.as_str()?.into(),
+                v.get("weight").and_then(Value::as_f64).unwrap_or(1.0),
+            ))
+        })
+        .collect();
+    let initiative = initiative.to_string();
+    let target = target.to_string();
+    tokio::task::spawn_blocking(move || {
+        restore_cloud_edges_cancellable(&store, &initiative, &target, &edges, || {
+            cancel.is_cancelled()
+        })
+    })
+    .await
+    .map_err(|e| McpError::internal_error(format!("edge import task failed: {e}"), None))?
+    .map_err(to_mcp)
 }
 
 /// Creates a soft link from a local node to a cloud node by id — a reference
@@ -957,4 +988,73 @@ pub fn sync_review(store: &Store, initiative: &str) -> Result<CallToolResult, Mc
         "\nReview the PROPOSE list, then `share <name> <initiative>` the ones you approve.",
     );
     Ok(text(&out))
+}
+
+#[cfg(test)]
+mod cloud_read_tests {
+    use super::{cloud_recall, pull};
+    use crate::cloud_client::CloudClient;
+    use axum::{Json, Router, routing::get};
+    use kaeru_core::{Store, recall_id_by_name};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn full_cloud_read_is_scoped_and_does_not_import_then_pull_is_idempotent() {
+        let app = Router::new()
+            .route("/api/v1/nodes/node-a", get(|| async { Json(json!({
+                "id":"node-a", "name":"full-note", "node_type":"reference", "tier":"archival",
+                "layer":"hot", "visibility":"shared", "body":"complete body", "tags":[]
+            })) }))
+            .route("/api/v1/initiatives/alpha/nodes", get(|| async {Json(json!([{"id":"node-a"}]))}))
+            .route("/api/v1/initiatives/beta/nodes", get(|| async {Json(Vec::<Value>::new())}))
+            .route("/api/v1/initiatives/alpha/edges", get(|| async {Json(Vec::<Value>::new())}));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cloud = CloudClient::new("test".into(), format!("http://{addr}"), String::new());
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let out = cloud_recall(Some(&cloud), "alpha", Some("node-a"), None, None, None)
+            .await
+            .unwrap();
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(text.contains("complete body") && text.contains("not imported"));
+        assert!(recall_id_by_name(&store, "full-note").unwrap().is_none());
+        let other = cloud_recall(Some(&cloud), "beta", Some("node-a"), None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            !serde_json::to_string(&other)
+                .unwrap()
+                .contains("complete body")
+        );
+        pull(
+            store.clone(),
+            Some(&cloud),
+            "node-a",
+            "alpha",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        pull(
+            store.clone(),
+            Some(&cloud),
+            "node-a",
+            "alpha",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .scoped(Some("alpha"), |s| recall_id_by_name(s, "full-note"))
+                .unwrap()
+                .as_deref(),
+            Some("node-a")
+        );
+        task.abort();
+    }
 }
