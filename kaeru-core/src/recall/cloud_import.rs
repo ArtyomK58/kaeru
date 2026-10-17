@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use cozo::{DataValue, ScriptMutability};
 
-use crate::{EdgeType, Result, Store, link_with_weight};
+use crate::{EdgeType, Error, Result, Store, link_with_weight};
 
 /// Outcome of a node-local edge import. Existing local decisions win.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -24,6 +24,8 @@ pub type CloudEdge = (String, String, String, f64);
 /// retractions. A repeated pull must not undo an explicit local unlink.
 /// Network access belongs to adapters; every substrate access stays here.
 /// The scope guard is held for one mutation, never for the entire import.
+/// Concurrent local edits must use `Store::scoped`, as adapters do; callers
+/// bypassing that guard are not serialized by this helper.
 pub fn restore_cloud_edges(
     store: &Store,
     initiative: &str,
@@ -43,7 +45,7 @@ pub fn restore_cloud_edges_cancellable(
     cancelled: impl Fn() -> bool,
 ) -> Result<EdgeImportResult> {
     if cancelled() {
-        return Err(crate::Error::Invalid(
+        return Err(Error::Invalid(
             "edge import cancelled; node may already be local".into(),
         ));
     }
@@ -61,6 +63,7 @@ pub fn restore_cloud_edges_cancellable(
         {
             continue;
         }
+        let kind = edge_type.as_str().to_string();
         if !seen.insert((src.clone(), dst.clone(), kind.clone())) {
             continue;
         }
@@ -74,13 +77,13 @@ pub fn restore_cloud_edges_cancellable(
     }
     let mut params = BTreeMap::new();
     params.insert("target".to_string(), DataValue::Str(target.into()));
-    // No @ modifier: a retracted key is a local decision too. Non-local soft
-    // links are distinct keys and must not suppress a real local edge.
+    // No @ modifier: a retracted local row is a decision too. Rows whose
+    // destination is remote must not suppress creation of a local edge.
     let rows = store.db_ref().run_script(r#"
-        ?[src, dst, edge_type] := *edge{src, dst, edge_type, dst_store}, src = $target, dst_store = 'local'
-        ?[src, dst, edge_type] := *edge{src, dst, edge_type, dst_store}, dst = $target, dst_store = 'local'
+        ?[src, dst, edge_type] := src = $target, *edge{src, dst, edge_type, dst_store}, dst_store = 'local'
+        ?[src, dst, edge_type] := dst = $target, *edge{src, dst, edge_type, dst_store}, dst_store = 'local'
     "#, params, ScriptMutability::Immutable)?;
-    let mut known: HashSet<(String, String, String)> = rows
+    let known: HashSet<(String, String, String)> = rows
         .rows
         .iter()
         .filter_map(|r| {
@@ -107,20 +110,57 @@ pub fn restore_cloud_edges_cancellable(
     let present = existing_node_ids(store, &ids)?;
     for (src, dst, kind, edge_type, weight) in candidates {
         if cancelled() {
-            return Err(crate::Error::Invalid(
+            return Err(Error::Invalid(
                 "edge import cancelled; partial import retained".into(),
             ));
         }
         if !present.contains(&src) || !present.contains(&dst) {
             continue;
         }
-        store.scoped(Some(initiative), |s| {
-            link_with_weight(s, &src, &dst, edge_type, weight)
+        // Batch reads are only a fast path. A scoped local writer may have
+        // changed the edge or forgotten an endpoint while we yielded. Recheck
+        // under the same guard as the write so its local decision wins.
+        let outcome = store.scoped(Some(initiative), |s| -> Result<Option<bool>> {
+            if cancelled() {
+                return Err(Error::Invalid(
+                    "edge import cancelled; partial import retained".into(),
+                ));
+            }
+            if has_local_edge_history(s, &src, &dst, &kind)? {
+                return Ok(Some(false));
+            }
+            if existing_node_ids(s, &[src.clone(), dst.clone()])?.len()
+                != if src == dst { 1 } else { 2 }
+            {
+                return Ok(None);
+            }
+            link_with_weight(s, &src, &dst, edge_type, weight)?;
+            Ok(Some(true))
         })?;
-        known.insert((src, dst, kind));
-        result.linked += 1;
+        match outcome {
+            Some(true) => result.linked += 1,
+            Some(false) => result.kept += 1,
+            None => {}
+        }
     }
     Ok(result)
+}
+
+/// A keyed historical lookup: an explicit local retraction is authoritative.
+fn has_local_edge_history(store: &Store, src: &str, dst: &str, kind: &str) -> Result<bool> {
+    let params = BTreeMap::from([
+        ("src".into(), DataValue::Str(src.into())),
+        ("dst".into(), DataValue::Str(dst.into())),
+        ("kind".into(), DataValue::Str(kind.into())),
+    ]);
+    let rows = store.db_ref().run_script(
+        "?[src] := src = $src, dst = $dst, edge_type = $kind,
+         *edge{src, dst, edge_type, dst_store}, dst_store = 'local'
+         :limit 1",
+        params,
+        ScriptMutability::Immutable,
+    )?;
+    Ok(!rows.rows.is_empty())
 }
 
 /// Batch, parameterised, live-node existence lookup. It deliberately ignores
@@ -177,7 +217,6 @@ mod tests {
     }
     #[test]
     fn cancellation_between_mutations_retains_valid_partial_import() {
-        use std::cell::Cell;
         let s = Store::open_in_memory().unwrap();
         let a = node(&s, "a");
         let b = node(&s, "b");
@@ -186,11 +225,8 @@ mod tests {
             (a.clone(), b, "refers_to".into(), 0.8),
             (a.clone(), c, "refers_to".into(), 0.6),
         ];
-        let checks = Cell::new(0);
         let result = super::restore_cloud_edges_cancellable(&s, "alpha", &a, &edges, || {
-            let count = checks.get() + 1;
-            checks.set(count);
-            count >= 3
+            !edges_of(&s, &a).unwrap().is_empty()
         });
         assert!(result.is_err());
         assert_eq!(edges_of(&s, &a).unwrap().len(), 1);
@@ -198,6 +234,98 @@ mod tests {
         let resumed = restore_cloud_edges(&s, "alpha", &a, &edges).unwrap();
         assert_eq!((resumed.linked, resumed.kept), (1, 1));
     }
+    #[test]
+    fn local_decisions_after_snapshot_win_over_import() {
+        use std::cell::Cell;
+
+        for retract in [false, true] {
+            let s = Store::open_in_memory().unwrap();
+            let a = node(&s, "a");
+            let b = node(&s, "b");
+            let checks = Cell::new(0);
+            let edges = vec![(a.clone(), b.clone(), "refers_to".into(), 0.8)];
+            let result = super::restore_cloud_edges_cancellable(&s, "alpha", &a, &edges, || {
+                let n = checks.get() + 1;
+                checks.set(n);
+                // Model a scoped writer completing after the import's batch
+                // snapshot but before its per-edge critical section.
+                if n == 2 {
+                    s.scoped(Some("alpha"), |s| {
+                        if retract {
+                            unlink(s, &a, &b, EdgeType::RefersTo)
+                        } else {
+                            link_with_weight(s, &a, &b, EdgeType::RefersTo, 0.2)
+                        }
+                    })
+                    .unwrap();
+                }
+                false
+            })
+            .unwrap();
+            assert_eq!((result.linked, result.kept), (0, 1));
+            let live = edges_of(&s, &a).unwrap();
+            if retract {
+                assert!(live.is_empty());
+            } else {
+                assert_eq!(live[0].3, 0.2);
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_forgotten_after_batch_lookup_is_not_linked() {
+        use std::cell::Cell;
+
+        let s = Store::open_in_memory().unwrap();
+        let a = node(&s, "a");
+        let b = node(&s, "b");
+        let checks = Cell::new(0);
+        let edges = vec![(a.clone(), b.clone(), "refers_to".into(), 0.8)];
+        let result = super::restore_cloud_edges_cancellable(&s, "alpha", &a, &edges, || {
+            let n = checks.get() + 1;
+            checks.set(n);
+            if n == 2 {
+                s.scoped(Some("alpha"), |s| forget(s, &b)).unwrap();
+            }
+            false
+        })
+        .unwrap();
+        assert_eq!(result.linked, 0);
+        assert!(edges_of(&s, &a).unwrap().is_empty());
+    }
+
+    #[test]
+    fn simultaneous_pulls_only_link_each_missing_edge_once() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let s = Arc::new(Store::open_in_memory().unwrap());
+        let a = node(&s, "a");
+        let b = node(&s, "b");
+        let edges = Arc::new(vec![(a.clone(), b, "refers_to".into(), 0.8)]);
+        let barrier = Arc::new(Barrier::new(2));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let (s, edges, a, barrier) = (s.clone(), edges.clone(), a.clone(), barrier.clone());
+                thread::spawn(move || {
+                    let checks = std::cell::Cell::new(0);
+                    super::restore_cloud_edges_cancellable(&s, "alpha", &a, &edges, || {
+                        checks.set(checks.get() + 1);
+                        if checks.get() == 2 {
+                            barrier.wait();
+                        }
+                        false
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results.iter().map(|r| r.linked).sum::<usize>(), 1);
+        assert_eq!(results.iter().map(|r| r.kept).sum::<usize>(), 1);
+        assert_eq!(edges_of(&s, &a).unwrap().len(), 1);
+    }
+
     #[test]
     fn import_uses_requested_scope_and_later_scoped_reads_keep_theirs() {
         let s = Store::open_in_memory().unwrap();
@@ -258,7 +386,7 @@ mod tests {
                 .len(),
             2
         );
-        // Scope is restored per mutation; reads from a second initiative cannot
+        // Scope is guarded per mutation; reads from a second initiative cannot
         // accidentally inherit alpha from an unguarded set-then-write sequence.
         assert!(
             s.scoped(Some("beta"), |s| crate::recall_id_by_name(s, "a"))
@@ -266,6 +394,40 @@ mod tests {
                 .is_none()
         );
     }
+    #[test]
+    fn canonical_edge_types_preserve_local_decisions_and_invalid_weights_are_skipped() {
+        let s = Store::open_in_memory().unwrap();
+        let a = node(&s, "a");
+        let b = node(&s, "b");
+        let c = node(&s, "c");
+        unlink(&s, &a, &b, EdgeType::RefersTo).unwrap();
+        let edges = vec![
+            (a.clone(), b.clone(), "REFERS-TO".into(), 0.8),
+            (a.clone(), c.clone(), "refers-to".into(), 0.4),
+            (a.clone(), c.clone(), "refers_to".into(), 0.9),
+            (a.clone(), a.clone(), "refers_to".into(), f64::NAN),
+            (a.clone(), a.clone(), "refers_to".into(), -0.1),
+            (a.clone(), a.clone(), "refers_to".into(), 1.1),
+        ];
+        let result = restore_cloud_edges(&s, "alpha", &a, &edges).unwrap();
+        assert_eq!((result.linked, result.kept), (1, 1));
+        assert_eq!(
+            edges_of(&s, &a).unwrap(),
+            vec![(a, c, "refers_to".into(), 0.4)]
+        );
+    }
+
+    #[test]
+    fn endpoint_batches_cross_the_chunk_boundary() {
+        let s = Store::open_in_memory().unwrap();
+        let ids: Vec<_> = (0..260).map(|i| node(&s, &format!("node-{i}"))).collect();
+        let mut requested = ids.clone();
+        requested.extend(["missing".into(), ids[0].clone()]);
+        let present = existing_node_ids(&s, &requested).unwrap();
+        assert_eq!(present.len(), ids.len());
+        assert!(ids.iter().all(|id| present.contains(id)));
+    }
+
     #[test]
     fn unrelated_scale_costs_no_local_queries_and_duplicates_keep_first_weight() {
         let s = Store::open_in_memory().unwrap();

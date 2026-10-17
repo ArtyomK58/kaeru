@@ -159,7 +159,7 @@ async fn do_pull(mem: &KaeruMemory, a: PullArgs) -> Value {
     let init_w = init.clone();
     let name_w = name.clone();
     let up = mem
-        .blocking(move |s| {
+        .blocking_in(Some(init.clone()), move |s| {
             kaeru_core::upsert_node(
                 s,
                 &id,
@@ -179,7 +179,7 @@ async fn do_pull(mem: &KaeruMemory, a: PullArgs) -> Value {
         return json!({ "error": e.to_string() });
     }
 
-    let edges = match recreate_local_edges(mem, &client, init.clone(), Some(a.id.clone())).await {
+    let edges = match recreate_local_edges(mem, &client, init.clone(), a.id.clone()).await {
         Ok(n) => n,
         Err(e) => {
             return json!({"error": format!("node imported, but edge restore failed: {e}"), "node_imported": true});
@@ -203,9 +203,8 @@ async fn recreate_local_edges(
     mem: &KaeruMemory,
     client: &CloudClient,
     initiative: String,
-    target_id: Option<String>,
+    target: String,
 ) -> Result<usize, String> {
-    let target = target_id.ok_or_else(|| "pull requires a target node".to_string())?;
     let (code, resp) = client.list_edges(&initiative).await?;
     if !(200..300).contains(&code) {
         return Err(format!(
@@ -315,3 +314,70 @@ crate::mem_tool_unscoped!(
         }
     }
 );
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+    use axum::{Json, Router, routing::get};
+    use kaeru_core::{Store, read_node_full};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    use super::{CloudRecallArgs, PullArgs, do_cloud_recall, do_pull};
+    use crate::KaeruMemory;
+    use crate::cloud_client::{CloudClient, CloudRegistry};
+
+    #[tokio::test]
+    async fn full_recall_is_read_only_scoped_and_pull_reports_partial_import() {
+        let app = Router::new()
+            .route("/api/v1/nodes/node-a", get(|| async { Json(json!({
+                "id":"node-a", "name":"full-note", "node_type":"reference", "tier":"archival",
+                "layer":"hot", "body":"complete body", "tags":[]
+            })) }))
+            .route("/api/v1/initiatives/alpha/nodes", get(|| async { Json(json!([{"id":"node-a"}])) }))
+            .route("/api/v1/initiatives/beta/nodes", get(|| async { Json(json!([])) }))
+            .route("/api/v1/initiatives/alpha/edges", get(|| async { StatusCode::SERVICE_UNAVAILABLE }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cloud = CloudClient::new("test".into(), format!("http://{addr}"), String::new());
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mem = KaeruMemory::with_clouds(
+            store.clone(),
+            "beta",
+            CloudRegistry::new(HashMap::from([("test".into(), cloud)]), None),
+        );
+        for (initiative, found) in [("alpha", true), ("beta", false)] {
+            let out = do_cloud_recall(
+                &mem,
+                CloudRecallArgs {
+                    initiative: initiative.into(),
+                    id: Some("node-a".into()),
+                    cloud: None,
+                    limit: None,
+                    offset: None,
+                    query: None,
+                },
+            )
+            .await;
+            assert_eq!(out.to_string().contains("complete body"), found);
+            assert!(read_node_full(&store, &"node-a".into()).unwrap().is_none());
+        }
+        let out = do_pull(
+            &mem,
+            PullArgs {
+                initiative: "alpha".into(),
+                id: "node-a".into(),
+                cloud: None,
+            },
+        )
+        .await;
+        assert_eq!(out["node_imported"], true);
+        assert!(out["error"].as_str().unwrap().contains("node imported"));
+        assert!(read_node_full(&store, &"node-a".into()).unwrap().is_some());
+        task.abort();
+    }
+}

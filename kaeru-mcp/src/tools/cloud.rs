@@ -536,6 +536,11 @@ pub async fn cloud_recall(
                     .collect()
             })
             .unwrap_or_default();
+        let properties_line = v
+            .get("properties")
+            .filter(|p| !p.is_null())
+            .map(|p| format!("\nproperties: {p}"))
+            .unwrap_or_default();
         let tag_line = if tags.is_empty() {
             String::new()
         } else {
@@ -543,7 +548,7 @@ pub async fn cloud_recall(
         };
         return Ok(text(&format!(
             "cloud `{}` · `{initiative}`: node {node_id} (read-only, not imported)\n\
-             name: {name}\ntype: {nt} · tier: {tier} · layer: {layer}{tag_line}\n\n{body}\n\n\
+             name: {name}\ntype: {nt} · tier: {tier} · layer: {layer}{tag_line}{properties_line}\n\n{body}\n\n\
              ⤷ `pull {node_id} {initiative}` materialises it locally with edges.",
             cloud.name()
         )));
@@ -698,6 +703,17 @@ pub async fn pull(
     cancel: CancellationToken,
 ) -> Result<CallToolResult, McpError> {
     let cloud = cloud.ok_or_else(not_configured)?;
+    let check_cancelled = || {
+        if cancel.is_cancelled() {
+            Err(McpError::internal_error(
+                "pull cancelled before node import",
+                None,
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
 
     let (code, resp) = cloud
         .get_node(id)
@@ -743,33 +759,50 @@ pub async fn pull(
     // ordering matters: the destructive case was pulling a `cite` to refresh
     // it and losing the URL it was cited for (#85).
     let properties = v.get("properties").filter(|p| !p.is_null()).cloned();
+    check_cancelled()?;
+    let write_cancel = cancel.clone();
     let write_store = store.clone();
     let write_id = id.to_string();
     let write_init = initiative.to_string();
     let write_name = name.clone();
     tokio::task::spawn_blocking(move || {
-        kaeru_core::upsert_node(
-            &write_store,
-            &write_id,
-            node_type,
-            tier,
-            &write_name,
-            body.as_deref(),
-            &tags,
-            Some(&write_init),
-            Visibility::Shared,
-            layer,
-            properties.as_ref(),
-        )
+        write_store.scoped(Some(&write_init), |s| {
+            if write_cancel.is_cancelled() {
+                return Err(Error::Invalid("pull cancelled before node import".into()));
+            }
+            kaeru_core::upsert_node(
+                s,
+                &write_id,
+                node_type,
+                tier,
+                &write_name,
+                body.as_deref(),
+                &tags,
+                Some(&write_init),
+                Visibility::Shared,
+                layer,
+                properties.as_ref(),
+            )
+        })
     })
     .await
     .map_err(|e| McpError::internal_error(format!("node import task failed: {e}"), None))?
     .map_err(to_mcp)?;
 
-    // Rebuild structure: recreate every cloud edge of this initiative whose
-    // BOTH endpoints already exist locally. Pulling more nodes fills in more
-    // edges over time; an edge to a not-yet-pulled node is simply skipped.
-    let rebuilt = recreate_local_edges(store, cloud, initiative, Some(id), cancel).await?;
+    // Restore this node's incident edges whose endpoints are local. Pulling
+    // more nodes fills in more edges; a not-yet-pulled endpoint is skipped.
+    let rebuilt = recreate_local_edges(store, cloud, initiative, id, cancel)
+        .await
+        .map_err(|e| {
+            McpError::internal_error(
+                format!(
+                    "cloud `{}`: node imported, but edge restore failed: {}",
+                    cloud.name(),
+                    e.message
+                ),
+                Some(serde_json::json!({ "node_imported": true })),
+            )
+        })?;
     let mut edge_parts = vec![format!("+{} edge(s) linked", rebuilt.linked)];
     if rebuilt.kept > 0 {
         edge_parts.push(format!("{} already local, left as they are", rebuilt.kept));
@@ -786,11 +819,9 @@ async fn recreate_local_edges(
     store: Arc<Store>,
     cloud: &CloudClient,
     initiative: &str,
-    target_node: Option<&str>,
+    target: &str,
     cancel: CancellationToken,
 ) -> Result<EdgeImportResult, McpError> {
-    let target =
-        target_node.ok_or_else(|| McpError::invalid_params("pull requires a target node", None))?;
     let (code, resp) = cloud.list_edges(initiative).await.map_err(|e| {
         McpError::internal_error(
             format!("cloud `{}` list edges failed: {e}", cloud.name()),
@@ -992,21 +1023,156 @@ pub fn sync_review(store: &Store, initiative: &str) -> Result<CallToolResult, Mc
 
 #[cfg(test)]
 mod cloud_read_tests {
-    use super::{cloud_recall, pull};
-    use crate::cloud_client::CloudClient;
-    use axum::{Json, Router, routing::get};
-    use kaeru_core::{Store, recall_id_by_name};
-    use serde_json::{Value, json};
+    use std::collections::HashMap;
     use std::sync::Arc;
+
+    use axum::extract::{Path, Query};
+    use axum::http::StatusCode;
+    use axum::{Json, Router, routing::get};
+    use kaeru_core::{Store, read_node_full, recall_id_by_name};
+    use serde_json::{Value, json};
     use tokio::net::TcpListener;
     use tokio_util::sync::CancellationToken;
+
+    use super::{cloud_recall, pull};
+    use crate::cloud_client::CloudClient;
+
+    #[tokio::test]
+    async fn full_cloud_membership_pages_and_fails_closed() {
+        let app = Router::new()
+            .route("/api/v1/nodes/{id}", get(|Path(id): Path<String>| async move {
+                Json(json!({"id": if id == "wrong-id" { "another-id" } else { &id },
+                    "name": "same name", "body": "private full body"}))
+            }))
+            .route("/api/v1/initiatives/{initiative}/nodes", get(
+                |Path(init): Path<String>, Query(q): Query<HashMap<String, String>>| async move {
+                    assert_eq!(q.get("q").map(String::as_str), Some("same name"));
+                    assert_eq!(q.get("limit").map(String::as_str), Some("500"));
+                    let offset = q.get("offset").unwrap().parse::<usize>().unwrap();
+                    match init.as_str() {
+                        "alpha / β?#" if offset == 0 => Json(json!((0..500).map(|i| json!({"id":format!("other-{i}")})).collect::<Vec<_>>())),
+                        "alpha / β?#" => { assert_eq!(offset, 500); Json(json!([{"id":"node-a"}])) },
+                        "malformed" => Json(json!({"not":"a list"})),
+                        _ => Json(json!([])),
+                    }
+                }
+            ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cloud = CloudClient::new("test".into(), format!("http://{addr}"), String::new());
+        let (status, body) = cloud
+            .get_node_in_initiative("alpha / β?#", "node-a")
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert!(body.contains("private full body"));
+        let (status, body) = cloud
+            .get_node_in_initiative("beta", "node-a")
+            .await
+            .unwrap();
+        assert_eq!(status, 404);
+        assert!(!body.contains("private full body"));
+        assert!(
+            cloud
+                .get_node_in_initiative("malformed", "node-a")
+                .await
+                .is_err()
+        );
+        assert!(
+            cloud
+                .get_node_in_initiative("alpha", "wrong-id")
+                .await
+                .is_err()
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_pull_never_imports_and_edge_failure_reports_partial_write() {
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/nodes/{id}",
+                get(move |Path(id): Path<String>| {
+                    let cancel = server_cancel.clone();
+                    async move {
+                        if id == "cancel-during-get" {
+                            cancel.cancel();
+                        }
+                        Json(
+                            json!({"id":id,"name":id,"node_type":"reference", "tier":"archival",
+                        "layer":"hot","body":"full body","tags":[]}),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/initiatives/alpha/edges",
+                get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cloud = CloudClient::new("test".into(), format!("http://{addr}"), String::new());
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let pre_cancel = CancellationToken::new();
+        pre_cancel.cancel();
+        assert!(
+            pull(
+                store.clone(),
+                Some(&cloud),
+                "pre-cancelled",
+                "alpha",
+                pre_cancel
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            pull(
+                store.clone(),
+                Some(&cloud),
+                "cancel-during-get",
+                "alpha",
+                cancel
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            read_node_full(&store, &"pre-cancelled".into())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_node_full(&store, &"cancel-during-get".into())
+                .unwrap()
+                .is_none()
+        );
+        let err = pull(
+            store.clone(),
+            Some(&cloud),
+            "partial",
+            "alpha",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.data.unwrap()["node_imported"], true);
+        assert!(err.message.contains("node imported"));
+        assert!(read_node_full(&store, &"partial".into()).unwrap().is_some());
+        task.abort();
+    }
 
     #[tokio::test]
     async fn full_cloud_read_is_scoped_and_does_not_import_then_pull_is_idempotent() {
         let app = Router::new()
             .route("/api/v1/nodes/node-a", get(|| async { Json(json!({
                 "id":"node-a", "name":"full-note", "node_type":"reference", "tier":"archival",
-                "layer":"hot", "visibility":"shared", "body":"complete body", "tags":[]
+                "layer":"hot", "visibility":"shared", "body":"complete body", "tags":[],
+                "properties":{"url":"https://example.test/source"}
             })) }))
             .route("/api/v1/initiatives/alpha/nodes", get(|| async {Json(json!([{"id":"node-a"}]))}))
             .route("/api/v1/initiatives/beta/nodes", get(|| async {Json(Vec::<Value>::new())}))
@@ -1021,6 +1187,7 @@ mod cloud_read_tests {
             .unwrap();
         let text = serde_json::to_string(&out).unwrap();
         assert!(text.contains("complete body") && text.contains("not imported"));
+        assert!(text.contains("https://example.test/source"));
         assert!(recall_id_by_name(&store, "full-note").unwrap().is_none());
         let other = cloud_recall(Some(&cloud), "beta", Some("node-a"), None, None, None)
             .await

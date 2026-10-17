@@ -100,7 +100,7 @@ impl CloudClient {
 
     /// `GET /api/v1/nodes/{id}` — fetch a node's full record.
     pub async fn get_node(&self, id: &str) -> Result<(u16, String), String> {
-        let url = format!("{}/api/v1/nodes/{id}", self.base_url);
+        let url = format!("{}/api/v1/nodes/{}", self.base_url, urlencoding(id));
         self.get(&url).await
     }
 
@@ -118,6 +118,12 @@ impl CloudClient {
         }
         let node: Value = serde_json::from_str(&body)
             .map_err(|e| format!("cloud `{}` invalid node: {e}", self.name()))?;
+        if node.get("id").and_then(Value::as_str) != Some(id) {
+            return Err(format!(
+                "cloud `{}` returned a different node id",
+                self.name()
+            ));
+        }
         let name = node
             .get("name")
             .and_then(Value::as_str)
@@ -195,8 +201,9 @@ impl CloudClient {
             .map(|q| format!("&q={}", urlencoding(q)))
             .unwrap_or_default();
         let url = format!(
-            "{}/api/v1/initiatives/{initiative}/nodes?limit={limit}&offset={offset}{q}",
-            self.base_url
+            "{}/api/v1/initiatives/{}/nodes?limit={limit}&offset={offset}{q}",
+            self.base_url,
+            urlencoding(initiative)
         );
         self.get(&url).await
     }
@@ -261,7 +268,11 @@ impl CloudClient {
     }
 
     pub async fn list_edges(&self, initiative: &str) -> Result<(u16, String), String> {
-        let url = format!("{}/api/v1/initiatives/{initiative}/edges", self.base_url);
+        let url = format!(
+            "{}/api/v1/initiatives/{}/edges",
+            self.base_url,
+            urlencoding(initiative)
+        );
         self.get(&url).await
     }
 
